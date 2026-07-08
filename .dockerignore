@@ -1,0 +1,11 @@
+.git
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+*.egg-info
+
+reports
+artifacts/hf
+room_matching.csv
+tests

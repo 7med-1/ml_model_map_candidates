@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/baseline/
+!artifacts/baseline/.gitkeep
+!artifacts/hf/
+!artifacts/hf/.gitkeep
+reports/*
+!reports/.gitkeep
+
+room_matching.csv

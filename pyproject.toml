@@ -1,0 +1,37 @@
+[project]
+name = "ml-model-map-candidates"
+version = "0.1.0"
+description = "Room name matching with a lightweight baseline model and an optional Hugging Face model."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "fastapi>=0.116,<1.0",
+  "joblib>=1.4,<2.0",
+  "numpy>=2.0,<3.0",
+  "scikit-learn>=1.5,<2.0",
+  "scipy>=1.14,<2.0",
+  "uvicorn>=0.30,<1.0",
+]
+
+[project.optional-dependencies]
+hf = [
+  "accelerate>=1.10,<2.0",
+  "torch>=2.4,<3.0",
+  "transformers>=4.57,<5.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28,<1.0",
+  "pytest>=8.3,<9.0",
+]
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["room_matcher*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
