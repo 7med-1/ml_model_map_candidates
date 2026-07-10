@@ -5,7 +5,6 @@ __all__ = [
     "cleaning",
     "evaluate",
     "model",
-    "model2",
     "paths",
     "train",
 ]

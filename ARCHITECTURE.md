@@ -518,59 +518,7 @@ So the inference rule is:
 
 The API entry point is `room_matcher/api.py`.
 
-## 14. Hugging Face Model
-
-The optional second model lives in `room_matcher/model2.py`.
-
-It uses a multilingual transformer as a cross-encoder:
-
-\[
-(q,c) \to \text{Transformer}([q;c]) \to \text{logits} \to \text{softmax}
-\]
-
-The default checkpoint is:
-
-- `microsoft/Multilingual-MiniLM-L12-H384`
-
-with tokenizer override:
-
-- `xlm-roberta-base`
-
-### 14.1 HF Pair Classification
-
-For each pair \((q,c)\), the transformer outputs logits:
-
-\[
-\ell(q,c) = (\ell_0, \ell_1)
-\]
-
-Then:
-
-\[
-\Pr(y=1 \mid q,c)
-=
-\frac{e^{\ell_1}}{e^{\ell_0}+e^{\ell_1}}
-\]
-
-This score replaces the logistic baseline score, but the downstream thresholding and scenario evaluation are the same.
-
-### 14.2 HF Training Objective
-
-The transformer model is trained as a standard binary sequence-classification model with cross-entropy:
-
-\[
-\mathcal{L}_{\text{HF}}
-=
--
-\sum_i
-\log \Pr(y_i \mid q_i,c_i)
-\]
-
-The pair construction, split logic, and candidate-list evaluation remain aligned with the baseline model so the comparison is fair.
-
-## 15. Files Produced
-
-### Baseline
+## 14. Files Produced
 
 - `artifacts/baseline/room_matching_clean.csv`
 - `artifacts/baseline/room_matching_clean.sqlite3`
@@ -582,20 +530,7 @@ The pair construction, split logic, and candidate-list evaluation remain aligned
 - `reports/baseline_evaluation_before_training.json`
 - `reports/baseline_evaluation_after_training.json`
 
-### Hugging Face
-
-- `artifacts/hf/room_matching_clean.csv`
-- `artifacts/hf/room_matching_clean.sqlite3`
-- `artifacts/hf/room_matcher/`
-- `reports/hf_cleaning_summary.json`
-- `reports/hf_training_summary.json`
-- `reports/hf_threshold_grid.json`
-- `reports/hf_sample_predictions.json`
-- `reports/hf_evaluation_after_training.json`
-
-## 16. End-to-End Command Flow
-
-### Baseline
+## 15. End-to-End Command Flow
 
 Clean:
 
@@ -618,7 +553,7 @@ uv run python -m room_matcher.train --input-csv room_matching.csv --max-clean-ro
 Evaluate after training:
 
 ```bash
-uv run python -m room_matcher.evaluate --model-type baseline --model-path artifacts/baseline/room_matcher.joblib --input-csv room_matching.csv --max-clean-rows 50000 --max-positive-pairs 5000 --rebuild-cleaned
+uv run python -m room_matcher.evaluate --model-path artifacts/baseline/room_matcher.joblib --input-csv room_matching.csv --max-clean-rows 50000 --max-positive-pairs 5000 --rebuild-cleaned
 ```
 
 Serve baseline model:
@@ -627,33 +562,7 @@ Serve baseline model:
 ROOM_MATCHER_MODEL_TYPE=baseline uv run uvicorn room_matcher.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Hugging Face
-
-Install optional dependencies:
-
-```bash
-uv sync --group dev --extra hf
-```
-
-Train HF model:
-
-```bash
-uv run python -m room_matcher.model2 --input-csv room_matching.csv --max-clean-rows 50000 --max-positive-pairs 5000 --rebuild-cleaned
-```
-
-Evaluate HF model:
-
-```bash
-uv run python -m room_matcher.evaluate --model-type hf --model-path artifacts/hf/room_matcher --input-csv room_matching.csv --max-clean-rows 50000 --max-positive-pairs 5000 --rebuild-cleaned
-```
-
-Serve HF model:
-
-```bash
-ROOM_MATCHER_MODEL_TYPE=hf ROOM_MATCHER_MODEL_PATH=artifacts/hf/room_matcher uv run uvicorn room_matcher.api:app --host 0.0.0.0 --port 8000 --reload
-```
-
-## 17. Summary
+## 16. Summary
 
 The current system is a pairwise ranking/classification setup.
 

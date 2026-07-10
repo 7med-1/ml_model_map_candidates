@@ -8,6 +8,7 @@ from room_matcher.paths import (
     BASELINE_CLEAN_CSV_PATH,
     BASELINE_SQLITE_PATH,
 )
+from room_matcher.progress import print_status
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +25,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    print_status("Starting cleaning command")
     stats = clean_room_matching_csv(
         input_csv_path=args.input_csv,
         output_csv_path=args.output_csv,
@@ -31,6 +33,7 @@ def main() -> None:
         report_path=args.report_path,
         max_rows=args.max_clean_rows,
     )
+    print_status("Cleaning command finished")
     print("Clean CSV:", stats.output_csv)
     print("SQLite DB:", stats.sqlite_path)
     print("Raw rows processed:", stats.raw_rows)

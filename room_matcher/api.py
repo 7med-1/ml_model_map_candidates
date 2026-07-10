@@ -9,13 +9,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from room_matcher.model import RoomMatcherModel
-from room_matcher.model2 import HFRoomMatcher
-from room_matcher.paths import BASELINE_MODEL_PATH, HF_MODEL_PATH
+from room_matcher.paths import BASELINE_MODEL_PATH, sync_legacy_baseline_artifacts
+from room_matcher.progress import print_status
 
 
-DEFAULT_MODEL_TYPE = "baseline"
 DEFAULT_BASELINE_MODEL_PATH = BASELINE_MODEL_PATH
-DEFAULT_HF_MODEL_PATH = HF_MODEL_PATH
 
 
 class PredictionRequest(BaseModel):
@@ -47,43 +45,50 @@ class PredictionResponse(BaseModel):
 app = FastAPI(title="Room Matcher API", version="0.1.0")
 
 
+def prepare_default_artifacts(model_type: str) -> None:
+    if model_type != "baseline":
+        raise ValueError("Only the baseline model is supported.")
+    if "ROOM_MATCHER_MODEL_PATH" not in os.environ:
+        sync_legacy_baseline_artifacts()
+
+
 @lru_cache
 def get_model_bundle() -> tuple[Any, dict[str, object]]:
     model_type = get_model_type()
+    prepare_default_artifacts(model_type)
     model_path = get_model_path(model_type)
     if not model_path.exists():
         raise FileNotFoundError(
             f"{model_type} model artifact not found at {model_path}. Train the model first."
         )
-    if model_type == "baseline":
-        return RoomMatcherModel.load(model_path)
-    if model_type == "hf":
-        return HFRoomMatcher.load(model_path)
-    raise ValueError(
-        f"Unsupported ROOM_MATCHER_MODEL_TYPE={model_type!r}. Use 'baseline' or 'hf'."
-    )
+    print_status(f"Loading {model_type} model from: {model_path}")
+    return RoomMatcherModel.load(model_path)
 
 
 def get_model_type() -> str:
-    return os.environ.get("ROOM_MATCHER_MODEL_TYPE", DEFAULT_MODEL_TYPE).strip().lower()
+    model_type = os.environ.get("ROOM_MATCHER_MODEL_TYPE", "baseline").strip().lower()
+    if model_type != "baseline":
+        raise ValueError("Only ROOM_MATCHER_MODEL_TYPE=baseline is supported.")
+    return model_type
 
 
 def get_model_path(model_type: str | None = None) -> Path:
     resolved_model_type = model_type or get_model_type()
-    default_path = (
-        DEFAULT_BASELINE_MODEL_PATH
-        if resolved_model_type == "baseline"
-        else DEFAULT_HF_MODEL_PATH
-    )
-    return Path(os.environ.get("ROOM_MATCHER_MODEL_PATH", default_path))
+    if resolved_model_type != "baseline":
+        raise ValueError("Only the baseline model is supported.")
+    return Path(os.environ.get("ROOM_MATCHER_MODEL_PATH", DEFAULT_BASELINE_MODEL_PATH))
 
 
 @app.get("/health")
 def health() -> dict[str, object]:
-    model_type = get_model_type()
-    model_path = get_model_path(model_type)
-    status = "ok" if model_path.exists() else "missing_model"
-    if model_type not in {"baseline", "hf"}:
+    try:
+        model_type = get_model_type()
+        prepare_default_artifacts(model_type)
+        model_path = get_model_path(model_type)
+        status = "ok" if model_path.exists() else "missing_model"
+    except ValueError:
+        model_type = os.environ.get("ROOM_MATCHER_MODEL_TYPE", "baseline").strip().lower()
+        model_path = Path(os.environ.get("ROOM_MATCHER_MODEL_PATH", DEFAULT_BASELINE_MODEL_PATH))
         status = "invalid_model_type"
     return {
         "status": status,

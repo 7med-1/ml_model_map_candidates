@@ -7,5 +7,3 @@ the ml takes care of the results
 the output: list of matching rooms
 
 baseline artifacts live under `artifacts/baseline/`
-
-hf artifacts live under `artifacts/hf/`

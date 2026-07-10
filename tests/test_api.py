@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 import room_matcher.api as api
+from room_matcher.paths import BASELINE_MODEL_PATH, LEGACY_BASELINE_MODEL_PATH
 
 
 class DummyModel:
@@ -48,9 +51,48 @@ def test_predict_endpoint_returns_matches(monkeypatch) -> None:
     assert response.scored_candidates[0].score == 0.91
 
 
-def test_get_model_path_uses_hf_default(monkeypatch) -> None:
-    monkeypatch.setenv("ROOM_MATCHER_MODEL_TYPE", "hf")
-    assert str(api.get_model_path()) == "artifacts/hf/room_matcher"
+def test_get_model_path_rejects_non_baseline_model_type(monkeypatch) -> None:
+    monkeypatch.setenv("ROOM_MATCHER_MODEL_TYPE", "transformer")
+    with pytest.raises(ValueError, match="baseline"):
+        api.get_model_path()
+
+
+def test_health_reports_invalid_model_type(monkeypatch) -> None:
+    monkeypatch.setenv("ROOM_MATCHER_MODEL_TYPE", "transformer")
+    payload = api.health()
+
+    assert payload["status"] == "invalid_model_type"
+    assert payload["model_type"] == "transformer"
+
+
+def test_get_model_bundle_syncs_legacy_baseline_artifact(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ROOM_MATCHER_MODEL_TYPE", raising=False)
+    monkeypatch.delenv("ROOM_MATCHER_MODEL_PATH", raising=False)
+
+    LEGACY_BASELINE_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LEGACY_BASELINE_MODEL_PATH.write_text("legacy-model", encoding="utf-8")
+
+    loaded_paths: list[Path] = []
+
+    def fake_load(path: Path) -> tuple[DummyModel, dict[str, object]]:
+        loaded_paths.append(path)
+        return DummyModel(), {}
+
+    monkeypatch.setattr(api.RoomMatcherModel, "load", staticmethod(fake_load))
+    api.get_model_bundle.cache_clear()
+    try:
+        model, metadata = api.get_model_bundle()
+    finally:
+        api.get_model_bundle.cache_clear()
+
+    assert isinstance(model, DummyModel)
+    assert metadata == {}
+    assert BASELINE_MODEL_PATH.exists()
+    assert loaded_paths == [BASELINE_MODEL_PATH]
 
 
 def test_prediction_request_rejects_short_candidate_lists() -> None:

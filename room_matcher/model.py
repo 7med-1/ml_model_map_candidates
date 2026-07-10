@@ -16,11 +16,13 @@ from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.linear_model import SGDClassifier
 
 from room_matcher.cleaning import normalize_room_name
+from room_matcher.progress import print_status
 
 
 GENERIC_TOKENS = {
     "room",
     "bed",
+    "view",
     "with",
     "and",
     "the",
@@ -31,12 +33,43 @@ GENERIC_TOKENS = {
     "smoke",
     "accessible",
     "standard",
+    "size",
 }
 BED_TYPE_TOKENS = {"king", "queen", "double", "twin", "single", "sofa", "bunk"}
+VIEW_TOKENS = {
+    "water_view",
+    "pool_view",
+    "garden_view",
+    "city_view",
+    "mountain_view",
+    "runway_view",
+    "bridge_view",
+}
+ROOM_KIND_TOKENS = {"suite", "studio", "apartment", "bungalow", "villa", "family"}
+ROOM_CLASS_TOKENS = {
+    "standard",
+    "superior",
+    "deluxe",
+    "premium",
+    "executive",
+    "classic",
+    "luxury",
+    "moderate",
+}
+STRICT_QUERY_ATTRIBUTE_TOKENS = {"balcony", "terrace", "accessible"}
+REQUIRED_QUERY_TOKENS = BED_TYPE_TOKENS | VIEW_TOKENS | ROOM_KIND_TOKENS | {
+    "accessible",
+    "nonsmoking",
+    "smoking",
+    "balcony",
+    "terrace",
+}
 ATTRIBUTE_TOKENS = {
     "accessible",
     "nonsmoking",
     "smoking",
+    "balcony",
+    "terrace",
     "suite",
     "studio",
     "deluxe",
@@ -45,6 +78,19 @@ ATTRIBUTE_TOKENS = {
     "family",
     "junior",
     "executive",
+    "water_view",
+    "pool_view",
+    "garden_view",
+    "city_view",
+    "mountain_view",
+    "runway_view",
+    "bridge_view",
+    "room_only",
+    "breakfast_included",
+    "half_board",
+    "full_board",
+    "all_inclusive",
+    "nonrefundable",
 }
 
 
@@ -61,6 +107,21 @@ class RoomPair:
 class CandidateRecord:
     candidate_room: str
     candidate_room_normalized: str
+
+
+@dataclass(slots=True)
+class RoomProfile:
+    normalized: str
+    tokens: list[str]
+    token_set: set[str]
+    numbers: set[str]
+    bed_types: set[str]
+    view_types: set[str]
+    room_kinds: set[str]
+    room_classes: set[str]
+    smoking_state: str | None
+    bed_counts: dict[str, int]
+    total_bed_count: int | None
 
 
 @dataclass(slots=True)
@@ -128,10 +189,15 @@ class RoomMatcherModel:
         room_names = [room_name] * len(candidate_rooms)
         matrix = self._build_feature_matrix(room_names, candidate_rooms)
         probabilities = self.classifier.predict_proba(matrix)[:, 1]
+        query_profile = build_room_profile(room_name)
         results = [
             {
                 "candidate_room": candidate_room,
-                "score": float(score),
+                "score": adjust_prediction_score(
+                    float(score),
+                    query_profile,
+                    build_room_profile(candidate_room),
+                ),
             }
             for candidate_room, score in zip(candidate_rooms, probabilities, strict=True)
         ]
@@ -146,10 +212,15 @@ class RoomMatcherModel:
     ) -> dict[str, object]:
         active_threshold = self.threshold if threshold is None else threshold
         scored_candidates = self.predict_scores(room_name, candidate_rooms)
+        query_profile = build_room_profile(room_name)
         matched_rooms = [
             item["candidate_room"]
             for item in scored_candidates
             if item["score"] >= active_threshold
+            and is_candidate_compatible_for_live_match(
+                query_profile,
+                build_room_profile(item["candidate_room"]),
+            )
         ]
         return {
             "room_name": room_name,
@@ -190,6 +261,19 @@ class RoomMatcherModel:
             ],
             dtype=np.float64,
         )
+        expected_numeric_feature_count = self._expected_numeric_feature_count()
+        if expected_numeric_feature_count is not None:
+            if numeric_features.shape[1] > expected_numeric_feature_count:
+                numeric_features = numeric_features[:, :expected_numeric_feature_count]
+            elif numeric_features.shape[1] < expected_numeric_feature_count:
+                padding = np.zeros(
+                    (
+                        numeric_features.shape[0],
+                        expected_numeric_feature_count - numeric_features.shape[1],
+                    ),
+                    dtype=np.float64,
+                )
+                numeric_features = np.hstack([numeric_features, padding])
         numeric_matrix = csr_matrix(numeric_features)
         return hstack([text_matrix, numeric_matrix], format="csr")
 
@@ -203,40 +287,36 @@ class RoomMatcherModel:
             f"cross {room_name_normalized} {candidate_room_normalized}"
         )
 
+    def _expected_numeric_feature_count(self) -> int | None:
+        if not self._is_fitted or not hasattr(self.classifier, "n_features_in_"):
+            return None
+        expected_count = int(self.classifier.n_features_in_) - int(self.vectorizer.n_features)
+        return max(expected_count, 0)
+
     @staticmethod
     def _numeric_features(room_name: str, candidate_room: str) -> list[float]:
         room_name_normalized = normalize_room_name(room_name)
         candidate_room_normalized = normalize_room_name(candidate_room)
-        left_tokens = room_name_normalized.split()
-        right_tokens = candidate_room_normalized.split()
-        left_set = set(left_tokens)
-        right_set = set(right_tokens)
-        shared_tokens = left_set & right_set
-        union_tokens = left_set | right_set
-        left_numbers = extract_numbers(left_tokens)
-        right_numbers = extract_numbers(right_tokens)
-        left_beds = left_set & BED_TYPE_TOKENS
-        right_beds = right_set & BED_TYPE_TOKENS
-
-        jaccard = len(shared_tokens) / len(union_tokens) if union_tokens else 0.0
-        overlap_left = len(shared_tokens) / len(left_set) if left_set else 0.0
-        overlap_right = len(shared_tokens) / len(right_set) if right_set else 0.0
-        shared_numbers = left_numbers & right_numbers
-        number_overlap = len(shared_numbers) / len(left_numbers | right_numbers) if (left_numbers or right_numbers) else 0.0
-        bed_overlap = len(left_beds & right_beds) / len(left_beds | right_beds) if (left_beds or right_beds) else 0.0
-        attribute_match = sum(
-            1.0
-            for attribute in ATTRIBUTE_TOKENS
-            if (attribute in left_set) == (attribute in right_set)
-        ) / len(ATTRIBUTE_TOKENS)
+        left_profile = build_room_profile(normalized=room_name_normalized)
+        right_profile = build_room_profile(normalized=candidate_room_normalized)
+        pair_features = summarize_pair_features(left_profile, right_profile)
 
         return [
-            jaccard,
-            overlap_left,
-            overlap_right,
-            number_overlap,
-            bed_overlap,
-            attribute_match,
+            pair_features["jaccard"],
+            pair_features["overlap_left"],
+            pair_features["overlap_right"],
+            pair_features["number_overlap"],
+            pair_features["bed_overlap"],
+            pair_features["attribute_match"],
+            pair_features["query_specific_coverage"],
+            pair_features["required_token_miss_rate"],
+            pair_features["bed_count_gap"],
+            pair_features["smoking_conflict"],
+            pair_features["view_conflict"],
+            pair_features["room_kind_conflict"],
+            pair_features["room_class_conflict"],
+            pair_features["bed_type_conflict"],
+            pair_features["bed_count_conflict"],
             1.0 if room_name_normalized in candidate_room_normalized else 0.0,
             1.0 if candidate_room_normalized in room_name_normalized else 0.0,
             abs(len(room_name_normalized) - len(candidate_room_normalized))
@@ -248,8 +328,163 @@ def tokenize_room(value: str) -> list[str]:
     return normalize_room_name(value).split()
 
 
+def build_room_profile(
+    value: str | None = None,
+    *,
+    normalized: str | None = None,
+) -> RoomProfile:
+    resolved_normalized = normalized if normalized is not None else normalize_room_name(value or "")
+    tokens = resolved_normalized.split()
+    token_set = set(tokens)
+    bed_counts = extract_bed_counts(tokens)
+    return RoomProfile(
+        normalized=resolved_normalized,
+        tokens=tokens,
+        token_set=token_set,
+        numbers=extract_numbers(tokens),
+        bed_types=token_set & BED_TYPE_TOKENS,
+        view_types=token_set & VIEW_TOKENS,
+        room_kinds=token_set & ROOM_KIND_TOKENS,
+        room_classes=token_set & ROOM_CLASS_TOKENS,
+        smoking_state=extract_smoking_state(token_set),
+        bed_counts=bed_counts,
+        total_bed_count=sum(bed_counts.values()) if bed_counts else None,
+    )
+
+
 def extract_numbers(tokens: list[str]) -> set[str]:
     return {token for token in tokens if token.isdigit()}
+
+
+def extract_smoking_state(tokens: set[str]) -> str | None:
+    if "nonsmoking" in tokens:
+        return "nonsmoking"
+    if "smoking" in tokens:
+        return "smoking"
+    return None
+
+
+def extract_bed_counts(tokens: list[str]) -> dict[str, int]:
+    bed_counts: dict[str, int] = {}
+    for index, token in enumerate(tokens):
+        if token not in BED_TYPE_TOKENS:
+            continue
+
+        count = 1
+        if index > 0 and tokens[index - 1].isdigit():
+            count = int(tokens[index - 1])
+        elif index + 1 < len(tokens) and tokens[index + 1].isdigit():
+            count = int(tokens[index + 1])
+        elif index > 1 and tokens[index - 1] == "bed" and tokens[index - 2].isdigit():
+            count = int(tokens[index - 2])
+        elif index + 2 < len(tokens) and tokens[index + 1] == "bed" and tokens[index + 2].isdigit():
+            count = int(tokens[index + 2])
+
+        bed_counts[token] = max(bed_counts.get(token, 0), count)
+    return bed_counts
+
+
+def summarize_pair_features(
+    left_profile: RoomProfile,
+    right_profile: RoomProfile,
+) -> dict[str, float]:
+    shared_tokens = left_profile.token_set & right_profile.token_set
+    union_tokens = left_profile.token_set | right_profile.token_set
+    shared_numbers = left_profile.numbers & right_profile.numbers
+    shared_beds = left_profile.bed_types & right_profile.bed_types
+    shared_views = left_profile.view_types & right_profile.view_types
+    shared_room_kinds = left_profile.room_kinds & right_profile.room_kinds
+    shared_room_classes = left_profile.room_classes & right_profile.room_classes
+    query_specific_tokens = left_profile.token_set & REQUIRED_QUERY_TOKENS
+
+    bed_overlap = (
+        len(shared_beds) / len(left_profile.bed_types | right_profile.bed_types)
+        if (left_profile.bed_types or right_profile.bed_types)
+        else 0.0
+    )
+    number_overlap = (
+        len(shared_numbers) / len(left_profile.numbers | right_profile.numbers)
+        if (left_profile.numbers or right_profile.numbers)
+        else 0.0
+    )
+    attribute_match = sum(
+        1.0
+        for attribute in ATTRIBUTE_TOKENS
+        if (attribute in left_profile.token_set) == (attribute in right_profile.token_set)
+    ) / len(ATTRIBUTE_TOKENS)
+
+    query_specific_coverage = (
+        len(query_specific_tokens & right_profile.token_set) / len(query_specific_tokens)
+        if query_specific_tokens
+        else 0.0
+    )
+    required_token_miss_rate = (
+        len(query_specific_tokens - right_profile.token_set) / len(query_specific_tokens)
+        if query_specific_tokens
+        else 0.0
+    )
+    bed_count_gap = 0.0
+    bed_count_conflict = 0.0
+    if left_profile.total_bed_count and right_profile.total_bed_count:
+        bed_count_gap = abs(left_profile.total_bed_count - right_profile.total_bed_count) / max(
+            left_profile.total_bed_count,
+            right_profile.total_bed_count,
+            1,
+        )
+        bed_count_conflict = float(left_profile.total_bed_count != right_profile.total_bed_count)
+
+    return {
+        "jaccard": len(shared_tokens) / len(union_tokens) if union_tokens else 0.0,
+        "overlap_left": len(shared_tokens) / len(left_profile.token_set) if left_profile.token_set else 0.0,
+        "overlap_right": len(shared_tokens) / len(right_profile.token_set) if right_profile.token_set else 0.0,
+        "number_overlap": number_overlap,
+        "bed_overlap": bed_overlap,
+        "attribute_match": attribute_match,
+        "query_specific_coverage": query_specific_coverage,
+        "required_token_miss_rate": required_token_miss_rate,
+        "shared_view_ratio": (
+            len(shared_views) / len(left_profile.view_types | right_profile.view_types)
+            if (left_profile.view_types or right_profile.view_types)
+            else 0.0
+        ),
+        "shared_room_kind_ratio": (
+            len(shared_room_kinds) / len(left_profile.room_kinds | right_profile.room_kinds)
+            if (left_profile.room_kinds or right_profile.room_kinds)
+            else 0.0
+        ),
+        "shared_room_class_ratio": (
+            len(shared_room_classes) / len(left_profile.room_classes | right_profile.room_classes)
+            if (left_profile.room_classes or right_profile.room_classes)
+            else 0.0
+        ),
+        "smoking_conflict": float(
+            left_profile.smoking_state is not None
+            and right_profile.smoking_state is not None
+            and left_profile.smoking_state != right_profile.smoking_state
+        ),
+        "view_conflict": float(
+            bool(left_profile.view_types)
+            and bool(right_profile.view_types)
+            and not shared_views
+        ),
+        "room_kind_conflict": float(
+            bool(left_profile.room_kinds)
+            and bool(right_profile.room_kinds)
+            and not shared_room_kinds
+        ),
+        "room_class_conflict": float(
+            bool(left_profile.room_classes)
+            and bool(right_profile.room_classes)
+            and not shared_room_classes
+        ),
+        "bed_type_conflict": float(
+            bool(left_profile.bed_types)
+            and bool(right_profile.bed_types)
+            and not shared_beds
+        ),
+        "bed_count_gap": bed_count_gap,
+        "bed_count_conflict": bed_count_conflict,
+    }
 
 
 def informative_tokens(value: str) -> list[str]:
@@ -258,6 +493,129 @@ def informative_tokens(value: str) -> list[str]:
         for token in tokenize_room(value)
         if token not in GENERIC_TOKENS and not token.isdigit()
     ]
+
+
+def hard_negative_priority(
+    query_profile: RoomProfile,
+    candidate_profile: RoomProfile,
+) -> tuple[float, int]:
+    pair_features = summarize_pair_features(query_profile, candidate_profile)
+    conflict_count = int(pair_features["smoking_conflict"]) + int(pair_features["view_conflict"]) + int(
+        pair_features["room_kind_conflict"]
+    ) + int(pair_features["room_class_conflict"]) + int(pair_features["bed_type_conflict"]) + int(
+        pair_features["bed_count_conflict"]
+    )
+    similarity = (
+        0.35 * pair_features["overlap_left"]
+        + 0.2 * pair_features["overlap_right"]
+        + 0.15 * pair_features["jaccard"]
+        + 0.1 * pair_features["bed_overlap"]
+        + 0.1 * pair_features["query_specific_coverage"]
+        + 0.05 * pair_features["shared_view_ratio"]
+        + 0.05 * pair_features["shared_room_kind_ratio"]
+        + 0.05 * pair_features["shared_room_class_ratio"]
+    )
+    priority = (
+        similarity
+        + 0.4 * conflict_count
+        + 0.25 * pair_features["required_token_miss_rate"]
+        + 0.15 * pair_features["bed_count_gap"]
+    )
+    return priority, conflict_count
+
+
+def adjust_prediction_score(
+    base_score: float,
+    query_profile: RoomProfile,
+    candidate_profile: RoomProfile,
+) -> float:
+    pair_features = summarize_pair_features(query_profile, candidate_profile)
+    coverage = pair_features["query_specific_coverage"]
+    if coverage > 0:
+        adjusted_score = base_score * (coverage**3)
+    else:
+        adjusted_score = base_score
+
+    if pair_features["required_token_miss_rate"] > 0:
+        adjusted_score *= max(0.05, 1.0 - pair_features["required_token_miss_rate"]) ** 2
+    if pair_features["smoking_conflict"]:
+        adjusted_score *= 0.05
+    if pair_features["view_conflict"]:
+        adjusted_score *= 0.1
+    if pair_features["room_kind_conflict"]:
+        adjusted_score *= 0.05
+    if pair_features["room_class_conflict"]:
+        adjusted_score *= 0.05
+    if pair_features["bed_type_conflict"]:
+        adjusted_score *= 0.02
+    if pair_features["bed_count_conflict"]:
+        adjusted_score *= 0.2
+
+    return float(max(0.0, min(1.0, adjusted_score)))
+
+
+def query_required_match_tokens(query_profile: RoomProfile) -> set[str]:
+    required_tokens = set(query_profile.bed_types)
+    required_tokens.update(query_profile.view_types)
+    required_tokens.update(query_profile.room_kinds)
+    required_tokens.update(query_profile.token_set & STRICT_QUERY_ATTRIBUTE_TOKENS)
+    if query_profile.smoking_state:
+        required_tokens.add(query_profile.smoking_state)
+    return required_tokens
+
+
+def is_candidate_compatible_for_live_match(
+    query_profile: RoomProfile,
+    candidate_profile: RoomProfile,
+) -> bool:
+    pair_features = summarize_pair_features(query_profile, candidate_profile)
+    if pair_features["bed_type_conflict"]:
+        return False
+    if pair_features["view_conflict"]:
+        return False
+    if pair_features["room_kind_conflict"]:
+        return False
+    if pair_features["room_class_conflict"]:
+        return False
+    if pair_features["smoking_conflict"]:
+        return False
+    if pair_features["bed_count_conflict"]:
+        return False
+
+    required_tokens = query_required_match_tokens(query_profile)
+    if "balcony" in required_tokens and "balcony" not in candidate_profile.token_set:
+        return False
+    if "terrace" in required_tokens and "terrace" not in candidate_profile.token_set:
+        return False
+    if "accessible" in required_tokens and "accessible" not in candidate_profile.token_set:
+        return False
+    if query_profile.bed_types and not (query_profile.bed_types & candidate_profile.bed_types):
+        return False
+    if query_profile.view_types and not (query_profile.view_types & candidate_profile.view_types):
+        return False
+    if query_profile.room_kinds and not (query_profile.room_kinds & candidate_profile.room_kinds):
+        return False
+
+    return True
+
+
+def conflict_lookup_tokens(query_profile: RoomProfile) -> set[str]:
+    lookup_tokens = set(query_profile.bed_types)
+    lookup_tokens.update(query_profile.view_types)
+    lookup_tokens.update(query_profile.room_kinds)
+
+    if query_profile.bed_types:
+        lookup_tokens.update(BED_TYPE_TOKENS - query_profile.bed_types)
+    if query_profile.view_types:
+        lookup_tokens.update(VIEW_TOKENS - query_profile.view_types)
+    if query_profile.room_kinds:
+        lookup_tokens.update(ROOM_KIND_TOKENS - query_profile.room_kinds)
+    if query_profile.smoking_state == "nonsmoking":
+        lookup_tokens.add("smoking")
+    elif query_profile.smoking_state == "smoking":
+        lookup_tokens.add("nonsmoking")
+
+    return lookup_tokens
 
 
 def pair_weight(pair_count: int) -> float:
@@ -363,6 +721,19 @@ def build_token_index(
     return token_index
 
 
+def select_token_window(
+    candidates: list[CandidateRecord],
+    *,
+    seed_text: str,
+    limit: int,
+) -> list[CandidateRecord]:
+    if len(candidates) <= limit:
+        return candidates
+
+    start = stable_bucket(seed_text, bucket_count=len(candidates))
+    return [candidates[(start + offset) % len(candidates)] for offset in range(limit)]
+
+
 def sample_negative_candidates(
     room_name: str,
     positive_candidates: set[str],
@@ -370,20 +741,53 @@ def sample_negative_candidates(
     token_index: dict[str, list[CandidateRecord]],
     rng: random.Random,
     count: int,
+    per_token_limit: int = 80,
 ) -> list[CandidateRecord]:
     if count <= 0:
         return []
 
     selected: list[CandidateRecord] = []
     seen_candidates: set[str] = set()
+    query_profile = build_room_profile(normalized=room_name)
 
     hard_pool: list[CandidateRecord] = []
-    for token in informative_tokens(room_name):
-        hard_pool.extend(token_index.get(token, []))
+    lookup_tokens = list(dict.fromkeys(informative_tokens(room_name) + sorted(conflict_lookup_tokens(query_profile))))
+    for token in lookup_tokens:
+        hard_pool.extend(
+            select_token_window(
+                token_index.get(token, []),
+                seed_text=f"{room_name}|||{token}",
+                limit=per_token_limit,
+            )
+        )
 
-    rng.shuffle(hard_pool)
+    prioritized_conflicts: dict[str, tuple[float, CandidateRecord]] = {}
+    prioritized_similar: dict[str, tuple[float, CandidateRecord]] = {}
     for record in hard_pool:
         if record.candidate_room in positive_candidates or record.candidate_room in seen_candidates:
+            continue
+
+        candidate_profile = build_room_profile(normalized=record.candidate_room_normalized)
+        priority, conflict_count = hard_negative_priority(query_profile, candidate_profile)
+        if conflict_count > 0:
+            current = prioritized_conflicts.get(record.candidate_room)
+            if current is None or priority > current[0]:
+                prioritized_conflicts[record.candidate_room] = (priority, record)
+        elif priority > 0:
+            current = prioritized_similar.get(record.candidate_room)
+            if current is None or priority > current[0]:
+                prioritized_similar[record.candidate_room] = (priority, record)
+
+    for _priority, record in sorted(prioritized_conflicts.values(), key=lambda item: item[0], reverse=True):
+        if record.candidate_room in seen_candidates:
+            continue
+        seen_candidates.add(record.candidate_room)
+        selected.append(record)
+        if len(selected) >= count:
+            return selected
+
+    for _priority, record in sorted(prioritized_similar.values(), key=lambda item: item[0], reverse=True):
+        if record.candidate_room in seen_candidates:
             continue
         seen_candidates.add(record.candidate_room)
         selected.append(record)
@@ -419,11 +823,16 @@ def train_pairwise_model(
     epochs: int = 3,
     batch_size: int = 2_048,
     random_seed: int = 42,
+    progress_every_pairs: int = 50_000,
 ) -> dict[str, int]:
     total_positive_samples = 0
     total_negative_samples = 0
 
     for epoch in range(epochs):
+        print_status(
+            f"Training baseline epoch {epoch + 1}/{epochs} "
+            f"on {len(train_pairs):,} positive pairs"
+        )
         rng = random.Random(random_seed + epoch)
         shuffled_pairs = list(train_pairs)
         rng.shuffle(shuffled_pairs)
@@ -432,8 +841,10 @@ def train_pairwise_model(
         candidate_rooms: list[str] = []
         labels: list[int] = []
         weights: list[float] = []
+        epoch_positive_samples = 0
+        epoch_negative_samples = 0
 
-        for pair in shuffled_pairs:
+        for pair_index, pair in enumerate(shuffled_pairs, start=1):
             weight = pair_weight(pair.pair_count)
 
             room_names.append(pair.room_name)
@@ -441,6 +852,7 @@ def train_pairwise_model(
             labels.append(1)
             weights.append(weight)
             total_positive_samples += 1
+            epoch_positive_samples += 1
 
             negatives = sample_negative_candidates(
                 pair.room_name_normalized,
@@ -456,6 +868,7 @@ def train_pairwise_model(
                 labels.append(0)
                 weights.append(weight)
                 total_negative_samples += 1
+                epoch_negative_samples += 1
 
             if len(labels) >= batch_size:
                 model.fit_batch(room_names, candidate_rooms, labels, weights)
@@ -464,8 +877,19 @@ def train_pairwise_model(
                 labels.clear()
                 weights.clear()
 
+            if progress_every_pairs and pair_index % progress_every_pairs == 0:
+                print_status(
+                    f"Epoch {epoch + 1}/{epochs}: processed {pair_index:,} / {len(shuffled_pairs):,} pairs"
+                )
+
         if labels:
             model.fit_batch(room_names, candidate_rooms, labels, weights)
+
+        print_status(
+            f"Finished epoch {epoch + 1}/{epochs}: "
+            f"{epoch_positive_samples:,} positive samples, "
+            f"{epoch_negative_samples:,} negative samples"
+        )
 
     return {
         "positive_samples": total_positive_samples,

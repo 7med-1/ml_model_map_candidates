@@ -21,20 +21,16 @@ from room_matcher.model import (
     tune_threshold,
     write_json_report,
 )
-from room_matcher.model2 import HFRoomMatcher
 from room_matcher.paths import (
     BASELINE_ARTIFACTS_DIR,
     BASELINE_CLEANING_REPORT_PATH,
     BASELINE_CLEAN_CSV_PATH,
     BASELINE_MODEL_PATH,
     BASELINE_SQLITE_PATH,
-    HF_ARTIFACTS_DIR,
-    HF_CLEANING_REPORT_PATH,
-    HF_CLEAN_CSV_PATH,
-    HF_MODEL_PATH,
-    HF_SQLITE_PATH,
     REPORTS_ROOT,
+    sync_legacy_baseline_artifacts,
 )
+from room_matcher.progress import print_status
 
 
 class OverlapRoomMatcher:
@@ -109,7 +105,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-csv", default="room_matching.csv")
     parser.add_argument("--artifacts-dir", default=None)
     parser.add_argument("--reports-dir", default=str(REPORTS_ROOT))
-    parser.add_argument("--model-type", choices=["baseline", "hf"], default="baseline")
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--max-clean-rows", type=int, default=None)
     parser.add_argument("--max-positive-pairs", type=int, default=250_000)
@@ -125,31 +120,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def _load_or_build_cleaned_data(args: argparse.Namespace) -> tuple[Path, object]:
-    if args.model_type == "hf":
-        default_artifacts_dir = HF_ARTIFACTS_DIR
-        default_clean_csv_path = HF_CLEAN_CSV_PATH
-        default_sqlite_path = HF_SQLITE_PATH
-        default_cleaning_report_path = HF_CLEANING_REPORT_PATH
-    else:
-        default_artifacts_dir = BASELINE_ARTIFACTS_DIR
-        default_clean_csv_path = BASELINE_CLEAN_CSV_PATH
-        default_sqlite_path = BASELINE_SQLITE_PATH
-        default_cleaning_report_path = BASELINE_CLEANING_REPORT_PATH
+    sync_legacy_baseline_artifacts()
 
-    artifacts_dir = Path(args.artifacts_dir) if args.artifacts_dir else default_artifacts_dir
+    artifacts_dir = Path(args.artifacts_dir) if args.artifacts_dir else BASELINE_ARTIFACTS_DIR
     reports_dir = Path(args.reports_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    cleaned_csv_path = artifacts_dir / default_clean_csv_path.name
-    sqlite_path = artifacts_dir / default_sqlite_path.name
-    cleaning_report_path = reports_dir / default_cleaning_report_path.name
+    cleaned_csv_path = artifacts_dir / BASELINE_CLEAN_CSV_PATH.name
+    sqlite_path = artifacts_dir / BASELINE_SQLITE_PATH.name
+    cleaning_report_path = reports_dir / BASELINE_CLEANING_REPORT_PATH.name
 
     if (
         args.rebuild_cleaned
         or not cleaned_csv_path.exists()
         or not cleaning_report_path.exists()
     ):
+        print_status("Building cleaned dataset for evaluation")
         cleaning_stats = clean_room_matching_csv(
             input_csv_path=args.input_csv,
             output_csv_path=cleaned_csv_path,
@@ -158,14 +145,21 @@ def _load_or_build_cleaned_data(args: argparse.Namespace) -> tuple[Path, object]
             max_rows=args.max_clean_rows,
         )
     else:
+        print_status(f"Reusing existing cleaned dataset: {cleaned_csv_path}")
         cleaning_stats = load_cleaning_stats(cleaning_report_path)
 
     return cleaned_csv_path, cleaning_stats
 
 
 def evaluate_model(args: argparse.Namespace) -> dict[str, object]:
+    if args.baseline_only:
+        print_status("Starting heuristic baseline evaluation")
+    else:
+        print_status("Starting trained baseline evaluation")
+
     cleaned_csv_path, cleaning_stats = _load_or_build_cleaned_data(args)
 
+    print_status("Loading positive pairs for evaluation")
     pairs = load_positive_pairs(
         cleaned_csv_path,
         unique_pair_count=cleaning_stats.unique_pairs,
@@ -175,6 +169,7 @@ def evaluate_model(args: argparse.Namespace) -> dict[str, object]:
     if not pairs:
         raise RuntimeError("No usable pairs were loaded from the cleaned dataset.")
 
+    print_status(f"Loaded {len(pairs):,} positive pairs")
     provider_pool = build_provider_pool(pairs)
     positive_lookup = build_positive_lookup(pairs)
     token_index = build_token_index(provider_pool)
@@ -185,6 +180,12 @@ def evaluate_model(args: argparse.Namespace) -> dict[str, object]:
             "Validation/test split is empty. Increase max_positive_pairs or keep ambiguous rows."
         )
 
+    print_status(
+        "Evaluation split ready: "
+        f"validation={len(split_data['validation']):,}, "
+        f"test={len(split_data['test']):,}"
+    )
+    print_status("Building validation scenarios")
     validation_scenarios = build_candidate_scenarios(
         split_data["validation"],
         provider_pool=provider_pool,
@@ -196,6 +197,7 @@ def evaluate_model(args: argparse.Namespace) -> dict[str, object]:
         max_scenarios=args.max_eval_scenarios,
         random_seed=args.random_seed,
     )
+    print_status("Building test scenarios")
     test_scenarios = build_candidate_scenarios(
         split_data["test"],
         provider_pool=provider_pool,
@@ -210,24 +212,27 @@ def evaluate_model(args: argparse.Namespace) -> dict[str, object]:
 
     if args.baseline_only:
         model = OverlapRoomMatcher()
+        print_status("Scoring heuristic baseline on validation scenarios")
         validation_scores = score_scenarios(model, validation_scenarios)
         threshold, threshold_grid = tune_threshold(validation_scores)
         model.threshold = threshold
+        print_status(f"Selected heuristic threshold: {threshold:.2f}")
+        print_status("Scoring heuristic baseline on test scenarios")
         test_scores = score_scenarios(model, test_scenarios)
         mode = "baseline"
         metadata: dict[str, object] = {}
     else:
-        if args.model_type == "baseline":
-            model_path = Path(args.model_path) if args.model_path else BASELINE_MODEL_PATH
-            model, metadata = RoomMatcherModel.load(model_path)
-        else:
-            model_path = Path(args.model_path) if args.model_path else HF_MODEL_PATH
-            model, metadata = HFRoomMatcher.load(model_path)
+        model_path = Path(args.model_path) if args.model_path else BASELINE_MODEL_PATH
+        print_status(f"Loading trained baseline model from: {model_path}")
+        model, metadata = RoomMatcherModel.load(model_path)
+        print_status("Scoring validation scenarios")
         validation_scores = score_scenarios(model, validation_scenarios)
         threshold = float(metadata.get("threshold", model.threshold))
+        print_status(f"Using stored threshold: {threshold:.2f}")
+        print_status("Scoring test scenarios")
         test_scores = score_scenarios(model, test_scenarios)
         threshold_grid = []
-        mode = f"trained_{args.model_type}_model"
+        mode = "trained_baseline_model"
 
     validation_metrics = evaluate_scored_scenarios(validation_scores, threshold=threshold)
     test_metrics = evaluate_scored_scenarios(test_scores, threshold=threshold)
@@ -257,11 +262,15 @@ def evaluate_model(args: argparse.Namespace) -> dict[str, object]:
 
     if args.baseline_only:
         report_name = "baseline_evaluation_before_training.json"
-    elif args.model_type == "hf":
-        report_name = "hf_evaluation_after_training.json"
     else:
         report_name = "baseline_evaluation_after_training.json"
+    print_status(f"Writing evaluation report to: {Path(args.reports_dir) / report_name}")
     write_json_report(Path(args.reports_dir) / report_name, report)
+    print_status(
+        "Evaluation finished: "
+        f"validation_f1={validation_metrics['f1_mean']:.4f}, "
+        f"test_f1={test_metrics['f1_mean']:.4f}"
+    )
     return report
 
 

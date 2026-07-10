@@ -18,29 +18,19 @@ Cleans the raw CSV, trains the baseline room matcher, evaluates it, and writes m
 `uv run python -m room_matcher.train --input-csv room_matching.csv --max-clean-rows 50000 --max-positive-pairs 5000 --rebuild-cleaned`
 Cleans a raw sample, trains on a sample of unique pairs from that cleaned data, and writes the trained artifact into `artifacts/baseline/` plus training/evaluation reports.
 
+Baseline commands automatically copy a newer legacy artifact from `artifacts/` into `artifacts/baseline/` so the API and evaluation use the baseline path.
+
 `uv run python -m room_matcher.evaluate --input-csv room_matching.csv --max-clean-rows 50000 --max-positive-pairs 5000 --rebuild-cleaned`
 Loads the trained baseline artifact from `artifacts/baseline/room_matcher.joblib` and evaluates it on the same sampled dataset, then writes `reports/baseline_evaluation_after_training.json`.
-
-`uv run python -m room_matcher.evaluate --model-type hf --model-path artifacts/hf/room_matcher --input-csv room_matching.csv --max-clean-rows 50000 --max-positive-pairs 5000 --rebuild-cleaned`
-Loads the trained Hugging Face artifact from `artifacts/hf/room_matcher` and evaluates it on the sampled dataset, then writes `reports/hf_evaluation_after_training.json`.
 
 `ROOM_MATCHER_MODEL_TYPE=baseline uv run uvicorn room_matcher.api:app --host 0.0.0.0 --port 8000 --reload`
 Starts the FastAPI app with the baseline model from `artifacts/baseline/room_matcher.joblib`.
 
-`ROOM_MATCHER_MODEL_TYPE=hf ROOM_MATCHER_MODEL_PATH=artifacts/hf/room_matcher uv run uvicorn room_matcher.api:app --host 0.0.0.0 --port 8000 --reload`
-Starts the FastAPI app with the Hugging Face model.
-
 `curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" -d '{"room_name":"Standard King Room","candidate_rooms":["Room, 1 King Bed, Non Smoking","Suite, 2 Queen Beds, Non Smoking","Room, 2 Double Beds","Deluxe Ocean View","Accessible Studio"]}'`
 Calls the API with one room name and five candidate rooms.
 
-`uv sync --group dev --extra hf`
-Installs the optional Hugging Face training stack on top of the baseline dependencies.
-
-`uv run python -m room_matcher.model2 --input-csv room_matching.csv --max-clean-rows 50000 --max-positive-pairs 5000 --rebuild-cleaned`
-Downloads the default small multilingual Hugging Face model, fine-tunes it for the same matching task, and writes its artifacts into `artifacts/hf/`.
-
 `docker build -t room-matcher-baseline .`
-Builds a baseline-only API image without the Hugging Face dependency stack.
+Builds the baseline API image.
 
 `docker run --rm -p 8000:8000 room-matcher-baseline`
 Runs the baseline-only API container.

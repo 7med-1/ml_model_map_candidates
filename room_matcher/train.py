@@ -26,7 +26,9 @@ from room_matcher.paths import (
     BASELINE_MODEL_PATH,
     BASELINE_SQLITE_PATH,
     REPORTS_ROOT,
+    sync_legacy_baseline_artifacts,
 )
+from room_matcher.progress import print_status
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +55,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
+    print_status("Starting baseline training run")
+    sync_legacy_baseline_artifacts()
+
     artifacts_dir = Path(args.artifacts_dir)
     reports_dir = Path(args.reports_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -68,6 +73,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         or not cleaned_csv_path.exists()
         or not cleaning_report_path.exists()
     ):
+        print_status("Building cleaned baseline dataset")
         cleaning_stats = clean_room_matching_csv(
             input_csv_path=args.input_csv,
             output_csv_path=cleaned_csv_path,
@@ -76,8 +82,10 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
             max_rows=args.max_clean_rows,
         )
     else:
+        print_status(f"Reusing existing cleaned dataset: {cleaned_csv_path}")
         cleaning_stats = load_cleaning_stats(cleaning_report_path)
 
+    print_status("Loading positive training pairs from cleaned dataset")
     pairs = load_positive_pairs(
         cleaned_csv_path,
         unique_pair_count=cleaning_stats.unique_pairs,
@@ -87,6 +95,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
     if not pairs:
         raise RuntimeError("No usable pairs were loaded from the cleaned dataset.")
 
+    print_status(f"Loaded {len(pairs):,} positive pairs")
     provider_pool = build_provider_pool(pairs)
     positive_lookup = build_positive_lookup(pairs)
     token_index = build_token_index(provider_pool)
@@ -97,7 +106,15 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
             "Train/validation/test split is empty. Increase max_positive_pairs or keep ambiguous rows."
         )
 
+    print_status(
+        "Pair split ready: "
+        f"train={len(split_data['train']):,}, "
+        f"validation={len(split_data['validation']):,}, "
+        f"test={len(split_data['test']):,}"
+    )
+
     model = RoomMatcherModel()
+    print_status("Training baseline pairwise model")
     training_summary = train_pairwise_model(
         model,
         split_data["train"],
@@ -110,6 +127,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         random_seed=args.random_seed,
     )
 
+    print_status("Building validation candidate scenarios")
     validation_scenarios = build_candidate_scenarios(
         split_data["validation"],
         provider_pool=provider_pool,
@@ -121,10 +139,12 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         max_scenarios=args.max_eval_scenarios,
         random_seed=args.random_seed,
     )
+    print_status("Scoring validation scenarios and tuning threshold")
     validation_scores = score_scenarios(model, validation_scenarios)
     threshold, threshold_grid = tune_threshold(validation_scores)
     model.threshold = threshold
 
+    print_status("Building test candidate scenarios")
     test_scenarios = build_candidate_scenarios(
         split_data["test"],
         provider_pool=provider_pool,
@@ -136,6 +156,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         max_scenarios=args.max_eval_scenarios,
         random_seed=args.random_seed + 1,
     )
+    print_status("Scoring test scenarios")
     test_scores = score_scenarios(model, test_scenarios)
     validation_metrics = evaluate_scored_scenarios(validation_scores, threshold=threshold)
     test_metrics = evaluate_scored_scenarios(test_scores, threshold=threshold)
@@ -157,8 +178,10 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         "test_metrics": test_metrics,
         "cli_args": vars(args),
     }
+    print_status(f"Saving trained baseline model to: {model_path}")
     model.save(model_path, metadata)
 
+    print_status("Writing baseline reports")
     write_json_report(reports_dir / "baseline_training_summary.json", metadata)
     write_json_report(
         reports_dir / "baseline_threshold_grid.json",
@@ -176,6 +199,12 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         },
     )
 
+    print_status(
+        "Baseline training run finished: "
+        f"validation_f1={validation_metrics['f1_mean']:.4f}, "
+        f"test_f1={test_metrics['f1_mean']:.4f}, "
+        f"threshold={threshold:.2f}"
+    )
     return metadata
 
 
